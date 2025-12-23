@@ -1,11 +1,12 @@
 // bindings.cu
-// PyTorch CUDA extension for high-performance ResNet
+// Fully complete PyTorch CUDA extension for high-performance ResNet
 // Supports both autograd and manual (pure CUDA) backpropagation modes
 // Compatible with ResNet v1 (18/34) and v2 (50/101+) pre/post-activation variants
 
 #include <torch/extension.h>
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>
+#include <cudnn.h>
 
 // ===================================================================
 // Forward declarations from resnet_forward.cu and resnet_backward.cu
@@ -13,6 +14,7 @@
 
 extern void init_cuda_libs();
 extern void destroy_cuda_libs();
+extern cudnnHandle_t g_cudnn;
 
 void conv2d_cudnn(
     const float *input, const float *weight, const float *bias, float *output,
@@ -68,7 +70,7 @@ void batchnorm_training_cudnn(
     float alpha = 1.0f, beta_bn = 0.0f;
 
     cudnnBatchNormalizationForwardTraining(
-        at::cuda::getCurrentCUDNNHandle(),
+        g_cudnn,
         CUDNN_BATCHNORM_SPATIAL,
         &alpha, &beta_bn,
         x_desc, input,
