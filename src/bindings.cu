@@ -2,19 +2,17 @@
 // Fully complete PyTorch CUDA extension for high-performance ResNet
 // Supports both autograd and manual (pure CUDA) backpropagation modes
 // Compatible with ResNet v1 (18/34) and v2 (50/101+) pre/post-activation variants
-
 #include <torch/extension.h>
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>
 #include <cudnn.h>
-
 // ===================================================================
 // Forward declarations from resnet_forward.cu and resnet_backward.cu
 // ===================================================================
-
 extern void init_cuda_libs();
 extern void destroy_cuda_libs();
 extern cudnnHandle_t g_cudnn;
+extern cublasHandle_t g_cublas;
 
 void conv2d_cudnn(
     const float *input, const float *weight, const float *bias, float *output,
@@ -51,7 +49,6 @@ void relu_backward_cudnn(
 // ===================================================================
 // Training-mode BatchNorm (cuDNN)
 // ===================================================================
-
 void batchnorm_training_cudnn(
     const float *input, float *output,
     float *running_mean, float *running_var,
@@ -63,12 +60,9 @@ void batchnorm_training_cudnn(
     cudnnTensorDescriptor_t x_desc, bn_desc;
     cudnnCreateTensorDescriptor(&x_desc);
     cudnnCreateTensorDescriptor(&bn_desc);
-
     cudnnSetTensor4dDescriptor(x_desc, CUDNN_TENSOR_NCHW, CUDNN_DATA_FLOAT, N, C, H, W);
     cudnnDeriveBNTensorDescriptor(bn_desc, x_desc, CUDNN_BATCHNORM_SPATIAL);
-
     float alpha = 1.0f, beta_bn = 0.0f;
-
     cudnnBatchNormalizationForwardTraining(
         g_cudnn,
         CUDNN_BATCHNORM_SPATIAL,
@@ -80,7 +74,6 @@ void batchnorm_training_cudnn(
         momentum,
         save_mean, save_invvar,
         epsilon);
-
     cudnnDestroyTensorDescriptor(x_desc);
     cudnnDestroyTensorDescriptor(bn_desc);
 }
@@ -88,7 +81,6 @@ void batchnorm_training_cudnn(
 // ===================================================================
 // Fused Conv + BN + ReLU Forward
 // ===================================================================
-
 torch::Tensor fused_conv_bn_relu_forward(
     const torch::Tensor &input,
     const torch::Tensor &weight,
@@ -104,12 +96,10 @@ torch::Tensor fused_conv_bn_relu_forward(
     bool training)
 {
     TORCH_CHECK(input.is_contiguous() && input.scalar_type() == torch::kFloat32);
-
     int N = input.size(0), C = input.size(1), H = input.size(2), W = input.size(3);
     int out_C = weight.size(0), KH = weight.size(2), KW = weight.size(3);
     int out_H = (H + 2 * padding - KH) / stride + 1;
     int out_W = (W + 2 * padding - KW) / stride + 1;
-
     auto output = torch::empty({N, out_C, out_H, out_W}, input.options());
 
     // Convolution
@@ -141,14 +131,12 @@ torch::Tensor fused_conv_bn_relu_forward(
 
     // ReLU in-place
     relu_cudnn(output.data_ptr<float>(), N, out_C, out_H, out_W);
-
     return output;
 }
 
 // ===================================================================
 // Fused Conv + BN Forward (no ReLU)
 // ===================================================================
-
 torch::Tensor fused_conv_bn_forward(
     const torch::Tensor &input,
     const torch::Tensor &weight,
@@ -164,12 +152,10 @@ torch::Tensor fused_conv_bn_forward(
     bool training)
 {
     TORCH_CHECK(input.is_contiguous() && input.scalar_type() == torch::kFloat32);
-
     int N = input.size(0), C = input.size(1), H = input.size(2), W = input.size(3);
     int out_C = weight.size(0), KH = weight.size(2), KW = weight.size(3);
     int out_H = (H + 2 * padding - KH) / stride + 1;
     int out_W = (W + 2 * padding - KW) / stride + 1;
-
     auto output = torch::empty({N, out_C, out_H, out_W}, input.options());
 
     conv2d_cudnn(
@@ -201,13 +187,12 @@ torch::Tensor fused_conv_bn_forward(
 }
 
 // ===================================================================
-// Manual Backward: Fused Conv + BN + ReLU (in-place gradient update)
+// Manual Backward: Fused Conv + BN + ReLU
 // ===================================================================
-
 void fused_conv_bn_relu_manual_backward(
     const torch::Tensor &grad_output,
-    const torch::Tensor &input,    // original input
-    const torch::Tensor &pre_relu, // output after BN, before ReLU (must be saved)
+    const torch::Tensor &input,    // original input to conv
+    const torch::Tensor &pre_relu, // saved output after BN, before ReLU
     const torch::Tensor &weight,
     const torch::Tensor &gamma,
     const torch::Tensor &save_mean,
@@ -217,15 +202,14 @@ void fused_conv_bn_relu_manual_backward(
     torch::Tensor &grad_bias,
     torch::Tensor &grad_gamma,
     torch::Tensor &grad_beta,
-    int stride, int padding)
+    int stride, int padding,
+    float eps) // <-- Added eps parameter
 {
     TORCH_CHECK(grad_output.is_contiguous());
-
     int N = input.size(0), C = input.size(1), H = input.size(2), W = input.size(3);
     int out_C = weight.size(0), KH = weight.size(2), KW = weight.size(3);
     int out_H = grad_output.size(2), out_W = grad_output.size(3);
 
-    // Temporary gradient buffer after ReLU backward
     auto grad_bn = grad_output.contiguous();
 
     // 1. ReLU backward
@@ -234,16 +218,16 @@ void fused_conv_bn_relu_manual_backward(
 
     // 2. BatchNorm backward
     batchnorm_backward_cudnn(
-        pre_relu.data_ptr<float>(), // input to BN (post-conv, pre-relu)
+        pre_relu.data_ptr<float>(),
         grad_bn.data_ptr<float>(),
-        grad_bn.data_ptr<float>(), // dinput (overwritten)
+        grad_bn.data_ptr<float>(),
         grad_gamma.data_ptr<float>(),
         grad_beta.data_ptr<float>(),
         gamma.data_ptr<float>(),
-        nullptr, // beta not needed
+        nullptr,
         save_mean.data_ptr<float>(),
         save_invvar.data_ptr<float>(),
-        1e-5, N, out_C, out_H, out_W);
+        eps, N, out_C, out_H, out_W); // <-- Now uses correct eps
 
     // 3. Conv backward
     conv2d_backward_cudnn(
@@ -260,11 +244,10 @@ void fused_conv_bn_relu_manual_backward(
 // ===================================================================
 // Manual Backward: Fused Conv + BN (no ReLU)
 // ===================================================================
-
 void fused_conv_bn_manual_backward(
     const torch::Tensor &grad_output,
     const torch::Tensor &input,
-    const torch::Tensor &post_bn, // output after BN
+    const torch::Tensor &post_bn, // saved output after BN
     const torch::Tensor &weight,
     const torch::Tensor &gamma,
     const torch::Tensor &save_mean,
@@ -274,7 +257,8 @@ void fused_conv_bn_manual_backward(
     torch::Tensor &grad_bias,
     torch::Tensor &grad_gamma,
     torch::Tensor &grad_beta,
-    int stride, int padding)
+    int stride, int padding,
+    float eps) // <-- Added eps parameter
 {
     int N = input.size(0), C = input.size(1), H = input.size(2), W = input.size(3);
     int out_C = weight.size(0), KH = weight.size(2), KW = weight.size(3);
@@ -292,7 +276,7 @@ void fused_conv_bn_manual_backward(
         nullptr,
         save_mean.data_ptr<float>(),
         save_invvar.data_ptr<float>(),
-        1e-5, N, out_C, out_H, out_W);
+        eps, N, out_C, out_H, out_W); // <-- Now uses correct eps
 
     conv2d_backward_cudnn(
         input.data_ptr<float>(),
@@ -308,7 +292,6 @@ void fused_conv_bn_manual_backward(
 // ===================================================================
 // PYBIND11 Bindings
 // ===================================================================
-
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
 {
     m.def("fused_conv_bn_relu_forward", &fused_conv_bn_relu_forward,
@@ -325,6 +308,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
 
     m.def("init_libs", []()
           { init_cuda_libs(); });
+
     m.def("destroy_libs", []()
           { destroy_cuda_libs(); });
 }
