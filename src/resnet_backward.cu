@@ -15,15 +15,32 @@ extern cublasHandle_t g_cublas;
 extern cudnnHandle_t g_cudnn;
 
 // ================================================================
-// Conv2D Backward (cuDNN) - Fixed output dim computation
+// Bias gradient helper kernel — MOVED UP to fix "undefined" error
+// ================================================================
+__global__ void add_bias_grad(const float *dout, float *dbias, int N, int out_features)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < out_features)
+    {
+        float sum = 0.0f;
+        for (int n = 0; n < N; ++n)
+        {
+            sum += dout[n * out_features + idx];
+        }
+        dbias[idx] = sum;
+    }
+}
+
+// ================================================================
+// Conv2D Backward (cuDNN) - Compatible with cuDNN 8.x
 // ================================================================
 void conv2d_backward_cudnn(
-    const float *input,  // NCHW
-    const float *weight, // [out_C, C, KH, KW]
-    const float *dout,   // [N, out_C, out_H, out_W]
-    float *dinput,       // [N, C, H, W] or nullptr
-    float *dweight,      // [out_C, C, KH, KW] or nullptr
-    float *dbias,        // [out_C] or nullptr
+    const float *input,
+    const float *weight,
+    const float *dout,
+    float *dinput,
+    float *dweight,
+    float *dbias,
     int N, int C, int H, int W,
     int out_C, int KH, int KW,
     int stride_h, int stride_w,
@@ -45,12 +62,11 @@ void conv2d_backward_cudnn(
     cudnnSetConvolution2dDescriptor(conv_desc, pad_h, pad_w, stride_h, stride_w,
                                     dilation_h, dilation_w, CUDNN_CROSS_CORRELATION, CUDNN_DATA_FLOAT);
 
-    // Properly query output dimensions using cuDNN (supports dilation correctly)
     int out_N, out_C_dim, out_H, out_W;
     cudnnGetConvolution2dForwardOutputDim(conv_desc, in_desc, filt_desc,
                                           &out_N, &out_C_dim, &out_H, &out_W);
 
-    assert(out_N == N && out_C_dim == out_C); // Sanity check
+    assert(out_N == N && out_C_dim == out_C);
 
     cudnnSetTensor4dDescriptor(out_desc, CUDNN_TENSOR_NCHW, CUDNN_DATA_FLOAT,
                                N, out_C, out_H, out_W);
@@ -66,15 +82,9 @@ void conv2d_backward_cudnn(
     void *workspace = nullptr;
     size_t workspace_bytes = 0;
 
-    // ======================
-    // 1. Backward Data (dinput)
-    // ======================
     if (dinput)
     {
-        cudnnConvolutionBwdDataAlgo_t bwd_data_algo;
-        cudnnGetConvolutionBackwardDataAlgorithm(g_cudnn, filt_desc, out_desc, conv_desc, in_desc,
-                                                 CUDNN_CONVOLUTION_BWD_DATA_PREFER_FASTEST,
-                                                 0, &bwd_data_algo);
+        cudnnConvolutionBwdDataAlgo_t bwd_data_algo = CUDNN_CONVOLUTION_BWD_DATA_ALGO_1;
 
         cudnnGetConvolutionBackwardDataWorkspaceSize(g_cudnn, filt_desc, out_desc, conv_desc,
                                                      in_desc, bwd_data_algo, &workspace_bytes);
@@ -96,15 +106,9 @@ void conv2d_backward_cudnn(
         }
     }
 
-    // ======================
-    // 2. Backward Filter (dweight)
-    // ======================
     if (dweight)
     {
-        cudnnConvolutionBwdFilterAlgo_t bwd_filter_algo;
-        cudnnGetConvolutionBackwardFilterAlgorithm(g_cudnn, in_desc, out_desc, conv_desc, filt_desc,
-                                                   CUDNN_CONVOLUTION_BWD_FILTER_PREFER_FASTEST,
-                                                   0, &bwd_filter_algo);
+        cudnnConvolutionBwdFilterAlgo_t bwd_filter_algo = CUDNN_CONVOLUTION_BWD_FILTER_ALGO_1;
 
         cudnnGetConvolutionBackwardFilterWorkspaceSize(g_cudnn, in_desc, out_desc, conv_desc,
                                                        filt_desc, bwd_filter_algo, &workspace_bytes);
@@ -123,16 +127,12 @@ void conv2d_backward_cudnn(
             cudaFree(workspace);
     }
 
-    // ======================
-    // 3. Backward Bias (dbias)
-    // ======================
     if (dbias)
     {
         cudnnConvolutionBackwardBias(g_cudnn, &alpha, out_desc, dout,
                                      &beta, bias_desc, dbias);
     }
 
-    // Cleanup
     cudnnDestroyTensorDescriptor(in_desc);
     cudnnDestroyTensorDescriptor(out_desc);
     if (dbias)
@@ -162,7 +162,6 @@ void batchnorm_backward_cudnn(
     cudnnCreateTensorDescriptor(&bn_desc);
 
     cudnnSetTensor4dDescriptor(x_desc, CUDNN_TENSOR_NCHW, CUDNN_DATA_FLOAT, N, C, H, W);
-    // bn_desc for scale/bias params: [1, C, 1, 1]
     cudnnSetTensor4dDescriptor(bn_desc, CUDNN_TENSOR_NCHW, CUDNN_DATA_FLOAT, 1, C, 1, 1);
 
     float alpha_data = 1.0f, beta_data = 0.0f;
@@ -178,7 +177,7 @@ void batchnorm_backward_cudnn(
         x_desc, dinput,
         bn_desc, gamma, dgamma, dbeta,
         epsilon,
-        nullptr, nullptr); // reserved pointers (can be nullptr in cuDNN >= 7)
+        nullptr, nullptr);
 
     cudnnDestroyTensorDescriptor(x_desc);
     cudnnDestroyTensorDescriptor(bn_desc);
@@ -208,7 +207,7 @@ void relu_backward_cudnn(
     cudnnActivationBackward(g_cudnn, act,
                             &alpha, desc, input,
                             desc, dout,
-                            desc, input, // pre-activation input
+                            desc, input,
                             &beta, desc, dinput);
 
     cudnnDestroyActivationDescriptor(act);
@@ -238,8 +237,7 @@ void maxpool_backward_cudnn(
     cudnnSetPooling2dDescriptor(pool_desc, CUDNN_POOLING_MAX, CUDNN_PROPAGATE_NAN,
                                 KH, KW, pad_h, pad_w, stride_h, stride_w);
 
-    int out_H, out_W;
-    int out_N, out_C;
+    int out_N, out_C, out_H, out_W;
     cudnnGetPooling2dForwardOutputDim(pool_desc, in_desc, &out_N, &out_C, &out_H, &out_W);
 
     cudnnSetTensor4dDescriptor(out_desc, CUDNN_TENSOR_NCHW, CUDNN_DATA_FLOAT,
@@ -249,7 +247,7 @@ void maxpool_backward_cudnn(
     float beta = 0.0f;
 
     cudnnPoolingBackward(g_cudnn, pool_desc, &alpha,
-                         out_desc, nullptr, // y (output) not needed for maxpool
+                         out_desc, nullptr,
                          out_desc, dout,
                          in_desc, input,
                          &beta,
@@ -264,18 +262,17 @@ void maxpool_backward_cudnn(
 // Fully Connected Backward (cuBLAS GEMM)
 // ================================================================
 void fully_connected_backward_cublas(
-    const float *input,  // [N, in_features]
-    const float *weight, // [out_features, in_features]
-    const float *dout,   // [N, out_features]
-    float *dinput,       // [N, in_features]
-    float *dweight,      // [out_features, in_features]
-    float *dbias,        // [out_features] or nullptr
+    const float *input,
+    const float *weight,
+    const float *dout,
+    float *dinput,
+    float *dweight,
+    float *dbias,
     int N, int in_features, int out_features)
 {
     float alpha = 1.0f;
     float beta = 0.0f;
 
-    // dinput = dout * weight
     if (dinput)
     {
         cublasSgemm(g_cublas,
@@ -288,7 +285,6 @@ void fully_connected_backward_cublas(
                     dinput, in_features);
     }
 
-    // dweight = dout^T * input
     if (dweight)
     {
         cublasSgemm(g_cublas,
@@ -301,29 +297,11 @@ void fully_connected_backward_cublas(
                     dweight, out_features);
     }
 
-    // dbias = sum(dout over batch)
     if (dbias)
     {
         int threads = 256;
         int blocks = (out_features + threads - 1) / threads;
         add_bias_grad<<<blocks, threads>>>(dout, dbias, N, out_features);
-    }
-}
-
-// ================================================================
-// Bias gradient helper kernel
-// ================================================================
-__global__ void add_bias_grad(const float *dout, float *dbias, int N, int out_features)
-{
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx < out_features)
-    {
-        float sum = 0.0f;
-        for (int n = 0; n < N; ++n)
-        {
-            sum += dout[n * out_features + idx];
-        }
-        dbias[idx] = sum;
     }
 }
 
@@ -341,7 +319,7 @@ __global__ void residual_add_backward_kernel(
     {
         float grad = dout[i];
         if (dinput1)
-            dinput1[i] += grad; // Use += in case of multiple adds
+            dinput1[i] += grad;
         if (dinput2)
             dinput2[i] += grad;
     }
