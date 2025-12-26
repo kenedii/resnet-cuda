@@ -1,0 +1,5 @@
+# requirements.txt
+--pre torch>=2.6.0.dev
+--pre torchvision>=0.21.0.dev
+--pre torchaudio>=2.6.0.dev
+--index-url https://download.pytorch.org/whl/nightly/cu126
