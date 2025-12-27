@@ -247,8 +247,8 @@ try:
     compiled_model.maxpool = nn.Identity()
     compiled_model = compiled_model.to(device)
 
-    print("Compiling model with torch.compile(mode='max-autotune')... (may take 30-60s on first run)")
-    compiled_model = torch.compile(compiled_model, mode="max-autotune")
+    print("Compiling model with torch.compile(mode='reduce-overhead')... (may take 30-60s on first run)")
+    compiled_model = torch.compile(compiled_model, mode="reduce-overhead")
 
     run_experiment(
         "3. Stock PyTorch ResNet34 + torch.compile()",
