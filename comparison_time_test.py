@@ -28,7 +28,8 @@ train_loader = DataLoader(
     batch_size=128,
     shuffle=True,
     num_workers=4,
-    pin_memory=True
+    pin_memory=True,
+    drop_last=True
 )
 test_loader = DataLoader(
     test_dataset,
@@ -222,7 +223,7 @@ def run_experiment(name, model):
 # Run all three experiments
 # ================================================================
 try:
-    # 1. Your custom fused model
+    # 1. Custom cuda kernels with autograd
     run_experiment(
         "1. Custom Fused Forward + Torch Autograd",
         ResNet34()
@@ -239,7 +240,7 @@ try:
         stock_model
     )
 
-    # 3. Stock PyTorch ResNet34 + torch.compile() (state-of-the-art)
+    # 3. Stock PyTorch ResNet34 + torch.compile()
     compiled_model = resnet34(num_classes=10)
     compiled_model.conv1 = nn.Conv2d(
         1, 64, kernel_size=3, stride=1, padding=1, bias=False
@@ -247,13 +248,15 @@ try:
     compiled_model.maxpool = nn.Identity()
     compiled_model = compiled_model.to(device)
 
-    print("Compiling model with torch.compile(mode='reduce-overhead')... (may take 30-60s on first run)")
-    compiled_model = torch.compile(compiled_model, mode="reduce-overhead")
-
+    # My 1080 Ti is too old for Triton so I can't test reduce-overhead 
+   # print("Compiling model with torch.compile(mode='reduce-overhead')...")
+    compiled_model = torch.compile(compiled_model, backend="cudagraphs")
+    unavailable = """ 
     run_experiment(
-        "3. Stock PyTorch ResNet34 + torch.compile()",
+        "3. Stock PyTorch ResNet34 + torch.compile(backend="cudagraphs")",
         compiled_model
     )
+    """
 
 finally:
     cu_resnet.destroy_libs()
